@@ -16,7 +16,6 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/hci-video
   .then(() => console.log('MongoDB connected'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// Import routes
 const deviceRoutes = require('./routes/devices');
 const callHistoryRoutes = require('./routes/callHistory');
 const roomRoutes = require('./routes/Room');
@@ -130,7 +129,6 @@ async function handleRoomMessage(ws, data) {
 
 async function handleJoinRoom(ws, roomId, participantId, participantName, role) {
   try {
-    // Check in-memory room
     if (!rooms.has(roomId)) {
       rooms.set(roomId, { participants: new Map() });
     }
@@ -146,11 +144,9 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
       return;
     }
 
-    // Check or create in database
     let dbRoom = await Room.findOne({ roomId });
     
     if (!dbRoom) {
-      // Create new room in database
       dbRoom = new Room({
         roomId,
         creator: {
@@ -173,7 +169,6 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
       await dbRoom.save();
       console.log(`[ROOM] Database room created: ${roomId}`);
     } else {
-      // Add participant to existing room
       const existingParticipant = dbRoom.participants.find(p => p.participantId === participantId);
       if (!existingParticipant) {
         dbRoom.addParticipant(participantId, participantName, role);
@@ -196,7 +191,6 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
     } else {
       const [otherParticipantId, otherWs] = existingParticipants[0];
 
-      // Start call in database
       if (dbRoom.status === 'waiting') {
         dbRoom.callStartTime = new Date();
         dbRoom.status = 'active';
@@ -266,14 +260,12 @@ async function handleParticipantLeave(ws) {
     room.participants.delete(ws.participantId);
     console.log(`[ROOM] Room ${ws.roomId} now has ${room.participants.size} participants`);
 
-    // Update database
     const dbRoom = await Room.findOne({ roomId: ws.roomId });
     if (dbRoom) {
       dbRoom.removeParticipant(ws.participantId);
 
       const activeParticipants = room.participants.size;
 
-      // End call if no participants left or only one left
       if (activeParticipants === 0 && dbRoom.status === 'active') {
         dbRoom.callEndTime = new Date();
         dbRoom.calculateDuration();
@@ -285,7 +277,6 @@ async function handleParticipantLeave(ws) {
       await dbRoom.save();
     }
 
-    // Notify other participants
     room.participants.forEach((otherWs) => {
       otherWs.send(JSON.stringify({
         type: 'participant-left',
@@ -293,7 +284,6 @@ async function handleParticipantLeave(ws) {
       }));
     });
 
-    // Clean up empty room
     if (room.participants.size === 0) {
       rooms.delete(ws.roomId);
       console.log(`[ROOM] Room ${ws.roomId} deleted (empty)`);
