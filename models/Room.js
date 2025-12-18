@@ -30,6 +30,9 @@ const roomSchema = new mongoose.Schema({
   sessionStartTime: {
     type: Date
   },
+  sessionId: {
+    type: String
+  },
   callEndTime: { 
     type: Date 
   },
@@ -41,7 +44,8 @@ const roomSchema = new mongoose.Schema({
     senderId: { type: String, required: true },
     senderName: { type: String, required: true },
     message: { type: String, required: true },
-    timestamp: { type: Date, default: Date.now }
+    timestamp: { type: Date, default: Date.now },
+    sessionId: { type: String }
   }],
   metadata: {
     totalParticipants: { type: Number, default: 0 },
@@ -134,7 +138,8 @@ roomSchema.methods.addChatMessage = function(senderId, senderName, message) {
     senderId,
     senderName: senderName || 'Anonymous',
     message: message || '',
-    timestamp: new Date()
+    timestamp: new Date(),
+    sessionId: this.sessionId
   });
 };
 

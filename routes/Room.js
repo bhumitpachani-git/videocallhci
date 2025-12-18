@@ -134,16 +134,11 @@ router.get('/:roomId/chat', async (req, res) => {
       return res.status(404).json({ message: 'Room not found' });
     }
 
-    // For current meeting, only expose chat messages from the current session start onward.
+    // For current meeting, only expose chat messages from the current session.
     // This keeps old chats stored in MongoDB, but each new meeting sees a fresh chat list.
     let messages = room.chatMessages || [];
-    const boundary = room.sessionStartTime || room.callStartTime;
-    if (boundary) {
-      const start = new Date(boundary).getTime();
-      messages = messages.filter(m => {
-        if (!m.timestamp) return false;
-        return new Date(m.timestamp).getTime() >= start;
-      });
+    if (room.sessionId) {
+      messages = messages.filter(m => m.sessionId === room.sessionId);
     }
 
     // Decrypt messages before sending

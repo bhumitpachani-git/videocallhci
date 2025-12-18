@@ -250,6 +250,7 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
     
     if (!dbRoom) {
       const now = new Date();
+      const sessionId = `${roomId}-${now.getTime()}`;
       // Plain names to model - pre-save encrypts
       dbRoom = new Room({
         roomId,
@@ -267,6 +268,7 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
         status: 'waiting',
         callStartTime: null,
         sessionStartTime: now,
+        sessionId,
         callEndTime: null,
         callDuration: 0,
         metadata: {
@@ -281,11 +283,13 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
       // If previous meeting in this room has ended, start a fresh session (keep old chat in DB)
       if (dbRoom.status === 'ended') {
         const now = new Date();
+        const sessionId = `${roomId}-${now.getTime()}`;
         dbRoom.participants = [];
         dbRoom.callStartTime = null;
         dbRoom.callEndTime = null;
         dbRoom.callDuration = 0;
         dbRoom.sessionStartTime = now;
+        dbRoom.sessionId = sessionId;
         dbRoom.status = 'waiting';
        if (dbRoom.metadata) {
           dbRoom.metadata.totalParticipants = 0;
@@ -312,6 +316,25 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
         roomId,
         role
       }));
+
+      // Send current session chat history to the participant
+      let messages = dbRoom.chatMessages || [];
+      if (dbRoom.sessionId) {
+        messages = messages.filter(m => m.sessionId === dbRoom.sessionId);
+      }
+      // Decrypt messages
+      const decryptedMessages = messages.map(m => ({
+        senderId: m.senderId,
+        senderName: decrypt(m.senderName),
+        message: decrypt(m.message),
+        timestamp: m.timestamp
+      }));
+      ws.send(JSON.stringify({
+        type: 'chat-history',
+        roomId,
+        chatMessages: decryptedMessages,
+        totalMessages: decryptedMessages.length
+      }));
     } else {
       const [otherParticipantId, otherWs] = existingParticipants[0];
 
@@ -337,6 +360,25 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
           name: otherWs.participantName, // Plain
           role: otherWs.role
         }
+      }));
+
+      // Send current session chat history to the new participant
+      let messages = dbRoom.chatMessages || [];
+      if (dbRoom.sessionId) {
+        messages = messages.filter(m => m.sessionId === dbRoom.sessionId);
+      }
+      // Decrypt messages
+      const decryptedMessages = messages.map(m => ({
+        senderId: m.senderId,
+        senderName: decrypt(m.senderName),
+        message: decrypt(m.message),
+        timestamp: m.timestamp
+      }));
+      ws.send(JSON.stringify({
+        type: 'chat-history',
+        roomId,
+        chatMessages: decryptedMessages,
+        totalMessages: decryptedMessages.length
       }));
 
       otherWs.send(JSON.stringify({
