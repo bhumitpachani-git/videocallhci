@@ -361,7 +361,7 @@ router.patch('/:roomId/end-call', async (req, res) => {
     room.status = 'ended';
 
     // Clear all chat messages in this room when call is explicitly ended
-    room.chatMessages = [];
+    // room.chatMessages = [];
 
     room.updatedAt = new Date();
     await room.save();
