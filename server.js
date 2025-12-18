@@ -317,17 +317,15 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
         role
       }));
 
-      // Send current session chat history to the participant
+      // Send all chat history in the room to the participant
       let messages = dbRoom.chatMessages || [];
-      if (dbRoom.sessionId) {
-        messages = messages.filter(m => m.sessionId === dbRoom.sessionId);
-      }
       // Decrypt messages
       const decryptedMessages = messages.map(m => ({
         senderId: m.senderId,
         senderName: decrypt(m.senderName),
         message: decrypt(m.message),
-        timestamp: m.timestamp
+        timestamp: m.timestamp,
+        sessionId: m.sessionId
       }));
       ws.send(JSON.stringify({
         type: 'chat-history',
@@ -362,17 +360,15 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
         }
       }));
 
-      // Send current session chat history to the new participant
+      // Send all chat history in the room to the new participant
       let messages = dbRoom.chatMessages || [];
-      if (dbRoom.sessionId) {
-        messages = messages.filter(m => m.sessionId === dbRoom.sessionId);
-      }
       // Decrypt messages
       const decryptedMessages = messages.map(m => ({
         senderId: m.senderId,
         senderName: decrypt(m.senderName),
         message: decrypt(m.message),
-        timestamp: m.timestamp
+        timestamp: m.timestamp,
+        sessionId: m.sessionId
       }));
       ws.send(JSON.stringify({
         type: 'chat-history',
