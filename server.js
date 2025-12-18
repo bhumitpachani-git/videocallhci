@@ -407,8 +407,8 @@ async function handleParticipantLeave(ws) {
         dbRoom.calculateDuration();
         dbRoom.status = 'ended';
 
-        // Clear all chat messages for this room when the call fully ends
-        dbRoom.chatMessages = [];
+        // Keep all chat messages in the room for history
+        // dbRoom.chatMessages = [];
 
         console.log(`[ROOM] Call ended in room ${ws.roomId}, duration: ${dbRoom.callDuration}s`);
       }
