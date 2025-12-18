@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const CryptoJS = require('crypto-js');
 
 const roomSchema = new mongoose.Schema({
   roomId: { 
@@ -6,7 +7,7 @@ const roomSchema = new mongoose.Schema({
     required: true, 
     unique: true 
   },
-  creator: {
+   creator: {
     participantId: { type: String, required: true },
     participantName: { type: String, required: true },
     role: { type: String, enum: ['admin', 'user'], default: 'user' }
@@ -25,6 +26,9 @@ const roomSchema = new mongoose.Schema({
   },
   callStartTime: { 
     type: Date 
+  },
+  sessionStartTime: {
+    type: Date
   },
   callEndTime: { 
     type: Date 
@@ -54,24 +58,70 @@ const roomSchema = new mongoose.Schema({
   }
 });
 
-roomSchema.index({ roomId: 1 });
-roomSchema.index({ 'creator.participantId': 1 });
-roomSchema.index({ createdAt: -1 });
-roomSchema.index({ status: 1 });
-
-roomSchema.methods.calculateDuration = function() {
-  if (this.callStartTime && this.callEndTime) {
-    this.callDuration = Math.floor((this.callEndTime - this.callStartTime) / 1000);
-  }
-  return this.callDuration;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const encrypt = (text) => {
+  const safeText = (text || 'Anonymous').trim();
+  if (safeText.length === 0) return encrypt('Anonymous');
+  return CryptoJS.AES.encrypt(safeText, ENCRYPTION_KEY).toString();
 };
+const decrypt = (ciphertext) => {
+  if (!ciphertext) return 'Anonymous';
+  try {
+    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
+    const plain = bytes.toString(CryptoJS.enc.Utf8).trim();
+    return plain.length > 0 ? plain : 'Anonymous';
+  } catch (err) {
+    return 'Anonymous';
+  }
+};
+
+roomSchema.pre('save', function(next) {
+  if (this.isModified('creator.participantName')) {
+    this.creator.participantName = encrypt(this.creator.participantName);
+  }
+  if (this.isModified('participants')) {
+    this.participants.forEach(p => {
+      p.participantName = encrypt(p.participantName);
+    });
+  }
+  if (this.isModified('chatMessages')) {
+    this.chatMessages.forEach(m => {
+      m.senderName = encrypt(m.senderName);
+      m.message = encrypt(m.message);
+    });
+  }
+  next();
+});
+
+roomSchema.post('findOne', function(doc) {
+  if (doc) decryptPHI(doc);
+});
+roomSchema.post('find', function(docs) {
+  docs.forEach(decryptPHI);
+});
+// Ensure any saved document we send back in responses is decrypted in memory
+roomSchema.post('save', function(doc) {
+  if (doc) decryptPHI(doc);
+});
+// Decrypt results of findOneAndUpdate (used by several REST routes)
+roomSchema.post('findOneAndUpdate', function(doc) {
+  if (doc) decryptPHI(doc);
+});
+function decryptPHI(doc) {
+  if (doc.creator) doc.creator.participantName = decrypt(doc.creator.participantName);
+  doc.participants.forEach(p => { p.participantName = decrypt(p.participantName); });
+  doc.chatMessages.forEach(m => {
+    m.senderName = decrypt(m.senderName);
+    m.message = decrypt(m.message);
+  });
+}
 
 roomSchema.methods.addParticipant = function(participantId, participantName, role = 'user') {
   const existing = this.participants.find(p => p.participantId === participantId);
   if (!existing) {
     this.participants.push({
       participantId,
-      participantName,
+      participantName: participantName || 'Anonymous',
       role,
       joinedAt: new Date()
     });
@@ -79,20 +129,36 @@ roomSchema.methods.addParticipant = function(participantId, participantName, rol
   }
 };
 
-roomSchema.methods.removeParticipant = function(participantId) {
-  const participant = this.participants.find(p => p.participantId === participantId);
-  if (participant && !participant.leftAt) {
-    participant.leftAt = new Date();
-  }
-};
-
 roomSchema.methods.addChatMessage = function(senderId, senderName, message) {
   this.chatMessages.push({
     senderId,
-    senderName,
-    message,
+    senderName: senderName || 'Anonymous',
+    message: message || '',
     timestamp: new Date()
   });
+};
+
+// Mark a participant as having left the room (used by WebSocket leave handling)
+roomSchema.methods.removeParticipant = function(participantId) {
+  const participant = this.participants.find(p => p.participantId === participantId);
+  if (participant) {
+    if (!participant.participantName) {
+      participant.participantName = 'Anonymous';
+    }
+    if (!participant.leftAt) {
+      participant.leftAt = new Date();
+    }
+  }
+};
+
+// Compute callDuration in seconds from callStartTime / callEndTime
+roomSchema.methods.calculateDuration = function() {
+  if (this.callStartTime && this.callEndTime) {
+    const ms = this.callEndTime.getTime() - this.callStartTime.getTime();
+    this.callDuration = ms > 0 ? Math.floor(ms / 1000) : 0;
+  } else {
+    this.callDuration = 0;
+  }
 };
 
 module.exports = mongoose.model('Room', roomSchema);

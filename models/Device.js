@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const CryptoJS = require('crypto-js');
 
 const deviceSchema = new mongoose.Schema({
   floor: { 
@@ -33,5 +34,44 @@ const deviceSchema = new mongoose.Schema({
   }
 });
 
-// MongoDB automatically creates _id field (ObjectId)
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const encrypt = (text) => {
+  const safe = (text || '').trim();
+  if (!safe) return '';
+  return CryptoJS.AES.encrypt(safe, ENCRYPTION_KEY).toString();
+};
+const decrypt = (ciphertext) => {
+  if (!ciphertext) return '';
+  try {
+    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
+    return bytes.toString(CryptoJS.enc.Utf8);
+  } catch (err) {
+    return '';
+  }
+};
+
+deviceSchema.pre('save', function(next) {
+  if (this.isModified('deviceName') && this.deviceName) {
+    this.deviceName = encrypt(this.deviceName);
+  }
+  next();
+});
+
+deviceSchema.post('findOne', function(doc) {
+  if (doc && doc.deviceName) doc.deviceName = decrypt(doc.deviceName);
+});
+deviceSchema.post('find', function(docs) {
+  docs.forEach(doc => {
+    if (doc.deviceName) doc.deviceName = decrypt(doc.deviceName);
+  });
+});
+// After create/save, ensure in-memory doc (used for responses) is decrypted
+deviceSchema.post('save', function(doc) {
+  if (doc && doc.deviceName) doc.deviceName = decrypt(doc.deviceName);
+});
+// Decrypt results of findOneAndUpdate / findByIdAndUpdate
+deviceSchema.post('findOneAndUpdate', function(doc) {
+  if (doc && doc.deviceName) doc.deviceName = decrypt(doc.deviceName);
+});
+
 module.exports = mongoose.model('Device', deviceSchema);

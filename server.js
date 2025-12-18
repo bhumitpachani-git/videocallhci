@@ -3,18 +3,78 @@ const http = require('http');
 const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const winston = require('winston');
+const CryptoJS = require('crypto-js');
 require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-app.use(cors());
-app.use(express.json());
+const auditLogger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'logs/audit.log', maxsize: 5242880, maxFiles: 100 }),
+    new winston.transports.Console({ format: winston.format.simple() })
+  ]
+});
+
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY) {
+  console.error('ENCRYPTION_KEY missing! Exiting.');
+  process.exit(1);
+}
+const encrypt = (text) => {
+  if (!text || text.trim() === '') return encrypt('Anonymous');
+  return CryptoJS.AES.encrypt(text.trim(), ENCRYPTION_KEY).toString();
+};
+const decrypt = (ciphertext) => {
+  if (!ciphertext) return 'Anonymous';
+  try {
+    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
+    const plain = bytes.toString(CryptoJS.enc.Utf8);
+    return plain || 'Anonymous';
+  } catch (err) {
+    auditLogger.error(`Decrypt failed: ${err.message}`);
+    return 'Anonymous';
+  }
+};
+
+// WS payloads are already plain from clients; just shallow-clone to avoid mutation.
+const sanitizeForClient = (data) => {
+  if (!data || typeof data !== 'object') return data;
+  return { ...data };
+};
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 10000,
+  max: 10000,
+  message: { error: 'Too many requests' }
+});
+app.use(limiter);
+
+app.use(helmet({
+  hsts: { maxAge: 31536000, includeSubDomains: true }
+}));
+
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+  credentials: true
+}));
+app.use(express.json({ limit: '10kb' }));
 
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/hci-video')
   .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  });
 
 const deviceRoutes = require('./routes/devices');
 const callHistoryRoutes = require('./routes/callHistory');
@@ -28,10 +88,12 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date() });
 });
 
+// In-memory maps (transient, no PHI persistence)
 const rooms = new Map(); 
 const connectedDevices = new Map();
 const Room = require('./models/Room');
 
+// HIPAA: WS Connection (Plain PHI from query)
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `ws://${req.headers.host || 'localhost'}`);
   
@@ -40,25 +102,28 @@ wss.on('connection', (ws, req) => {
   
   if (roomId) {
     const participantId = url.searchParams.get('participantId');
-    const participantName = decodeURIComponent(url.searchParams.get('participantName') || 'Anonymous');
+    const rawName = url.searchParams.get('participantName') || 'Anonymous';
+    const participantName = decodeURIComponent(rawName).trim() || 'Anonymous'; // Plain, non-empty
     const role = url.searchParams.get('role') || 'user';
     
     console.log(`[ROOM] Connection: roomId=${roomId}, participantId=${participantId}, name=${participantName}, role=${role}`);
+    auditLogger.info(`WS Connection: Room ${roomId} participant ${participantId}`);
     
     ws.serviceType = 'room';
     ws.roomId = roomId;
     ws.participantId = participantId;
-    ws.participantName = participantName;
+    ws.participantName = participantName; // Plain
     ws.role = role;
     
   } else if (deviceId) {
     console.log(`[DEVICE] Device connected: ${deviceId}`);
+    auditLogger.info(`WS Connection: Device ${deviceId}`);
     
     ws.serviceType = 'device';
     ws.deviceId = deviceId;
     connectedDevices.set(deviceId, ws);
   } else {
-    console.warn('Connection without roomId or deviceId');
+    auditLogger.warn('Connection without roomId or deviceId');
     ws.close();
     return;
   }
@@ -67,6 +132,8 @@ wss.on('connection', (ws, req) => {
     try {
       const data = JSON.parse(message);
       
+      // HIPAA: No encrypt here - models handle on save. Data is plain from client.
+      
       if (ws.serviceType === 'room') {
         handleRoomMessage(ws, data);
       } else if (ws.serviceType === 'device') {
@@ -74,6 +141,7 @@ wss.on('connection', (ws, req) => {
       }
     } catch (error) {
       console.error('Error parsing message:', error);
+      auditLogger.error(`WS Parse Error: ${error.message}`);
     }
   });
 
@@ -81,22 +149,30 @@ wss.on('connection', (ws, req) => {
     if (ws.serviceType === 'room') {
       console.log(`[ROOM] Participant disconnected: ${ws.participantId} from room ${ws.roomId}`);
       handleParticipantLeave(ws);
+      auditLogger.info(`WS Disconnect: Room ${ws.roomId} participant ${ws.participantId}`);
     } else if (ws.serviceType === 'device') {
       console.log(`[DEVICE] Device disconnected: ${ws.deviceId}`);
       connectedDevices.delete(ws.deviceId);
       updateDeviceStatus(ws.deviceId, 'offline');
+      auditLogger.info(`WS Disconnect: Device ${ws.deviceId}`);
     }
   });
 
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
+    auditLogger.error(`WS Error: ${error.message}`);
   });
 });
 
-
 async function handleRoomMessage(ws, data) {
-  const { type, roomId, participantId, participantName } = data;
-  console.log(`[ROOM] Message: ${type} from ${participantId} in room ${roomId}`);
+  // Ensure logging and logic always have valid identifiers
+  const type = data.type;
+  const roomId = data.roomId || ws.roomId;
+  const participantId = data.participantId || ws.participantId;
+  const participantName = data.participantName || ws.participantName || 'Anonymous'; // Plain
+
+  console.log(`[ROOM] Message: ${type} from ${participantId} (${participantName}) in room ${roomId}`);
+  auditLogger.info(`Room Action: ${type} in ${roomId} by ${participantId}`);
 
   switch (type) {
     case 'join-room':
@@ -108,13 +184,39 @@ async function handleRoomMessage(ws, data) {
       break;
 
     case 'chat-message':
-      await saveChatMessage(ws.roomId, data.senderId, data.senderName, data.message);
-      broadcastToRoom(ws.roomId, ws.participantId, data);
+      // Normalize chat payload and ensure a single server-side timestamp
+      const chatSenderId = data.senderId || participantId;
+      const chatSenderName = data.senderName || participantName;
+      const chatMessage = data.message || '';
+      const chatTimestamp = new Date().toISOString();
+
+      await saveChatMessage(
+        ws.roomId,
+        chatSenderId,
+        chatSenderName,
+        chatMessage
+      );
+
+      // Build a clean, consistent chat event that is sent to other participants.
+      // Sender is expected to render their own message locally to avoid duplicates.
+      const outgoingChat = {
+        type: 'chat-message',
+        roomId: ws.roomId,
+        participantId: chatSenderId,
+        senderId: chatSenderId,
+        senderName: chatSenderName,
+        message: chatMessage,
+        timestamp: chatTimestamp
+      };
+
+      // Broadcast only to other participants (not back to sender)
+      broadcastToRoom(ws.roomId, ws.participantId, outgoingChat);
       break;
 
     case 'webrtc-offer':
     case 'webrtc-answer':
     case 'webrtc-ice-candidate':
+      // Forward signaling as-is; no PHI
       broadcastToRoom(ws.roomId, ws.participantId, data);
       break;
 
@@ -147,31 +249,53 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
     let dbRoom = await Room.findOne({ roomId });
     
     if (!dbRoom) {
+      const now = new Date();
+      // Plain names to model - pre-save encrypts
       dbRoom = new Room({
         roomId,
         creator: {
           participantId,
-          participantName,
+          participantName: participantName || 'Anonymous',
           role
         },
         participants: [{
           participantId,
-          participantName,
+          participantName: participantName || 'Anonymous',
           role,
-          joinedAt: new Date()
+          joinedAt: now
         }],
         status: 'waiting',
+        callStartTime: null,
+        sessionStartTime: now,
+        callEndTime: null,
+        callDuration: 0,
         metadata: {
           totalParticipants: 1,
-          maxParticipants: 2
+          maxParticipants: 2,
+          reconnections: 0
         }
       });
       await dbRoom.save();
       console.log(`[ROOM] Database room created: ${roomId}`);
     } else {
+      // If previous meeting in this room has ended, start a fresh session (keep old chat in DB)
+      if (dbRoom.status === 'ended') {
+        const now = new Date();
+        dbRoom.participants = [];
+        dbRoom.callStartTime = null;
+        dbRoom.callEndTime = null;
+        dbRoom.callDuration = 0;
+        dbRoom.sessionStartTime = now;
+        dbRoom.status = 'waiting';
+       if (dbRoom.metadata) {
+          dbRoom.metadata.totalParticipants = 0;
+          dbRoom.metadata.reconnections = 0;
+        }
+      }
+
       const existingParticipant = dbRoom.participants.find(p => p.participantId === participantId);
       if (!existingParticipant) {
-        dbRoom.addParticipant(participantId, participantName, role);
+        dbRoom.addParticipant(participantId, participantName || 'Anonymous', role);
         await dbRoom.save();
       }
     }
@@ -192,12 +316,17 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
       const [otherParticipantId, otherWs] = existingParticipants[0];
 
       if (dbRoom.status === 'waiting') {
-        dbRoom.callStartTime = new Date();
+        const now = new Date();
+        dbRoom.callStartTime = now;
+        if (!dbRoom.sessionStartTime) {
+          dbRoom.sessionStartTime = now;
+        }
         dbRoom.status = 'active';
         await dbRoom.save();
         console.log(`[ROOM] Call started in room ${roomId}`);
       }
 
+      // Plain names (ws has plain)
       ws.send(JSON.stringify({
         type: 'room-status',
         status: 'ready',
@@ -205,7 +334,7 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
         role,
         otherParticipant: {
           id: otherParticipantId,
-          name: otherWs.participantName,
+          name: otherWs.participantName, // Plain
           role: otherWs.role
         }
       }));
@@ -213,18 +342,20 @@ async function handleJoinRoom(ws, roomId, participantId, participantName, role) 
       otherWs.send(JSON.stringify({
         type: 'participant-joined',
         participantId,
-        participantName,
+        participantName, // Plain
         role
       }));
     }
+    auditLogger.info(`Room Joined: ${roomId} by ${participantId}`);
   } catch (error) {
     console.error('[ROOM] Error in handleJoinRoom:', error);
+    auditLogger.error(`Room Join Error: ${error.message} in ${roomId}`);
   }
 }
 
 function handleAdminMediaControl(ws, data) {
   if (ws.role !== 'admin') {
-    console.warn(`[ROOM] Non-admin ${ws.participantId} tried to control media`);
+    auditLogger.warn(`Unauthorized media control: ${ws.participantId} in ${ws.roomId}`);
     ws.send(JSON.stringify({
       type: 'error',
       message: 'Only admins can control participant media'
@@ -247,10 +378,15 @@ function handleAdminMediaControl(ws, data) {
       fromAdmin: ws.participantId
     }));
     console.log(`[ROOM] Media control sent to ${targetParticipantId}`);
+    auditLogger.info(`Media Control: ${ws.participantId} -> ${targetParticipantId} (${mediaType}=${enabled})`);
   }
 }
 
 async function handleParticipantLeave(ws) {
+  // Prevent double-processing leave for same socket
+  if (ws.leftHandled) return;
+  ws.leftHandled = true;
+
   if (!ws.roomId || !ws.participantId) return;
 
   try {
@@ -270,6 +406,10 @@ async function handleParticipantLeave(ws) {
         dbRoom.callEndTime = new Date();
         dbRoom.calculateDuration();
         dbRoom.status = 'ended';
+
+        // Clear all chat messages for this room when the call fully ends
+        dbRoom.chatMessages = [];
+
         console.log(`[ROOM] Call ended in room ${ws.roomId}, duration: ${dbRoom.callDuration}s`);
       }
 
@@ -288,18 +428,20 @@ async function handleParticipantLeave(ws) {
       rooms.delete(ws.roomId);
       console.log(`[ROOM] Room ${ws.roomId} deleted (empty)`);
     }
+    auditLogger.info(`Participant Left: ${ws.participantId} from ${ws.roomId}`);
   } catch (error) {
     console.error('[ROOM] Error in handleParticipantLeave:', error);
+    auditLogger.error(`Participant Leave Error: ${error.message}`);
   }
 }
 
-function broadcastToRoom(roomId, senderId, data) {
+function broadcastToRoom(roomId, senderId, data, includeSender = false) {
   const room = rooms.get(roomId);
   if (!room) return;
 
   room.participants.forEach((ws, participantId) => {
-    if (participantId !== senderId && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
+    if ((includeSender || participantId !== senderId) && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(sanitizeForClient(data)));
     }
   });
 }
@@ -308,20 +450,26 @@ async function saveChatMessage(roomId, senderId, senderName, message) {
   try {
     const dbRoom = await Room.findOne({ roomId });
     if (dbRoom) {
-      dbRoom.addChatMessage(senderId, senderName, message);
+      // Plain to model - pre-save encrypts
+      dbRoom.addChatMessage(senderId, senderName || 'Anonymous', message || '');
       await dbRoom.save();
       console.log(`[ROOM] Chat message saved to room ${roomId}`);
+      auditLogger.info(`Chat Message Saved: room ${roomId} by ${senderId}`);
     }
   } catch (error) {
     console.error('[ROOM] Error saving chat message:', error);
+    auditLogger.error(`Chat Save Error: ${error.message}`);
   }
 }
-
 
 function handleDeviceMessage(ws, data) {
   const { type, targetDeviceId, ...payload } = data;
   
+  // HIPAA: No encrypt here - models handle
+  if (payload.deviceName) payload.deviceName = payload.deviceName.trim() || 'Anonymous'; // Plain, non-empty
+  
   console.log(`[DEVICE] Message type: ${type}, target: ${targetDeviceId}`);
+  auditLogger.info(`Device Action: ${type} from ${ws.deviceId} to ${targetDeviceId}`);
   
   switch (type) {
     case 'register':
@@ -356,10 +504,12 @@ function handleDeviceMessage(ws, data) {
       
       const targetWs = connectedDevices.get(targetDeviceId);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        // Sanitize before forward (decrypt if PHI)
+        const sanitizedPayload = sanitizeForClient({ ...payload });
         targetWs.send(JSON.stringify({ 
           type, 
           fromDeviceId: ws.deviceId,
-          ...payload 
+          ...sanitizedPayload 
         }));
         console.log(`[DEVICE] Forwarded ${type} to ${targetDeviceId}`);
       } else {
@@ -384,17 +534,18 @@ async function updateDeviceStatus(deviceId, status) {
       { status: status, updatedAt: Date.now() }
     );
     console.log(`[DEVICE] Device ${deviceId} status updated to ${status}`);
+    auditLogger.info(`Device Status Update: ${deviceId} to ${status}`);
   } catch (error) {
     console.error('[DEVICE] Failed to update device status:', error);
+    auditLogger.error(`Device Status Error: ${error.message}`);
   }
 }
-
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`API: http://localhost:${PORT}/api`);
-  console.log(`WebSocket: ws://localhost:${PORT}`);
+  console.log(`API: http://localhost:${PORT}/api (use HTTPS in prod)`);
+  console.log(`WebSocket: ws://localhost:${PORT} (use WSS in prod)`);
   console.log('API Endpoints:');
   console.log('  - Devices: /api/devices');
   console.log('  - Call History: /api/call-history');

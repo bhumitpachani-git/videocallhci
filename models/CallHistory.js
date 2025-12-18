@@ -1,14 +1,14 @@
 const mongoose = require('mongoose');
+const CryptoJS = require('crypto-js');
 
-// Device Usage sub-schema
 const deviceUsageSchema = new mongoose.Schema({
-  cpuUsage: { type: Number, default: 0 },      // percentage 0-100
-  ramUsage: { type: Number, default: 0 },      // percentage 0-100
-  ramTotal: { type: Number, default: 0 },      // in MB
-  ramUsed: { type: Number, default: 0 },       // in MB
-  networkUp: { type: Number, default: 0 },     // in KB/s
-  networkDown: { type: Number, default: 0 },   // in KB/s
-  batteryLevel: { type: Number }               // percentage 0-100 (optional)
+  cpuUsage: { type: Number, default: 0 },
+  ramUsage: { type: Number, default: 0 },
+  ramTotal: { type: Number, default: 0 },
+  ramUsed: { type: Number, default: 0 },
+  networkUp: { type: Number, default: 0 },
+  networkDown: { type: Number, default: 0 },
+  batteryLevel: { type: Number }
 }, { _id: false });
 
 const callHistorySchema = new mongoose.Schema({
@@ -19,7 +19,7 @@ const callHistorySchema = new mongoose.Schema({
   callerName: { 
     type: String, 
     required: true 
-  },
+  }, 
   receiverId: { 
     type: String, 
     required: true 
@@ -37,7 +37,7 @@ const callHistorySchema = new mongoose.Schema({
   },
   duration: { 
     type: Number, 
-    default: 0  // in seconds
+    default: 0
   },
   status: { 
     type: String, 
@@ -48,10 +48,61 @@ const callHistorySchema = new mongoose.Schema({
     type: Date, 
     default: Date.now 
   },
-  // Device usage metrics at time of call
   callerUsage: deviceUsageSchema,
   receiverUsage: deviceUsageSchema
 });
 
-// MongoDB automatically creates _id field (ObjectId)
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const encrypt = (text) => {
+  const safe = (text || '').trim();
+  if (!safe) return '';
+  return CryptoJS.AES.encrypt(safe, ENCRYPTION_KEY).toString();
+};
+const decrypt = (ciphertext) => {
+  if (!ciphertext) return '';
+  try {
+    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
+    return bytes.toString(CryptoJS.enc.Utf8);
+  } catch (err) {
+    return '';
+  }
+};
+
+callHistorySchema.pre('save', function(next) {
+  if (this.isModified('callerName') && this.callerName) {
+    this.callerName = encrypt(this.callerName);
+  }
+  if (this.isModified('receiverName') && this.receiverName) {
+    this.receiverName = encrypt(this.receiverName);
+  }
+  next();
+});
+
+callHistorySchema.post('findOne', function(doc) {
+  if (doc) {
+    if (doc.callerName) doc.callerName = decrypt(doc.callerName);
+    if (doc.receiverName) doc.receiverName = decrypt(doc.receiverName);
+  }
+});
+callHistorySchema.post('find', function(docs) {
+  docs.forEach(doc => {
+    if (doc.callerName) doc.callerName = decrypt(doc.callerName);
+    if (doc.receiverName) doc.receiverName = decrypt(doc.receiverName);
+  });
+});
+// Decrypt after create/save so new docs returned from save() are plain
+callHistorySchema.post('save', function(doc) {
+  if (doc) {
+    if (doc.callerName) doc.callerName = decrypt(doc.callerName);
+    if (doc.receiverName) doc.receiverName = decrypt(doc.receiverName);
+  }
+});
+// Decrypt results of findOneAndUpdate / findByIdAndUpdate
+callHistorySchema.post('findOneAndUpdate', function(doc) {
+  if (doc) {
+    if (doc.callerName) doc.callerName = decrypt(doc.callerName);
+    if (doc.receiverName) doc.receiverName = decrypt(doc.receiverName);
+  }
+});
+
 module.exports = mongoose.model('CallHistory', callHistorySchema);

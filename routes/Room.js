@@ -1,8 +1,49 @@
 const express = require('express');
 const router = express.Router();
+const Joi = require('joi');
 const Room = require('../models/Room');
+const winston = require('winston');
+const CryptoJS = require('crypto-js');
 
-// Get all rooms with pagination and filters
+const auditLogger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
+  transports: [new winston.transports.Console()]
+});
+
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const encrypt = (text) => {
+  const safeText = (text || 'Anonymous').trim();
+  if (safeText.length === 0) return encrypt('Anonymous');
+  return CryptoJS.AES.encrypt(safeText, ENCRYPTION_KEY).toString();
+};
+const decrypt = (ciphertext) => {
+  if (!ciphertext) return 'Anonymous';
+  try {
+    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
+    const plain = bytes.toString(CryptoJS.enc.Utf8).trim();
+    return plain.length > 0 ? plain : 'Anonymous';
+  } catch (err) {
+    return 'Anonymous';
+  }
+};
+
+const roomSchema = Joi.object({
+  roomId: Joi.string().alphanum().max(50).required(),
+  creator: Joi.object({
+    participantId: Joi.string().max(100).required(),
+    participantName: Joi.string().min(1).max(100).required(),
+    role: Joi.string().valid('admin', 'user')
+  }).required()
+});
+
+const participantSchema = Joi.object({
+  participantId: Joi.string().max(100).required(),
+  participantName: Joi.string().min(1).max(100).required(),
+  role: Joi.string().valid('admin', 'user')
+});
+
+
 router.get('/', async (req, res) => {
   try {
     const { 
@@ -28,6 +69,7 @@ router.get('/', async (req, res) => {
 
     const total = await Room.countDocuments(query);
 
+    auditLogger.info(`Room List Access: page ${page}`);
     res.json({
       rooms,
       pagination: {
@@ -38,24 +80,25 @@ router.get('/', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Room List Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Get room by roomId
 router.get('/:roomId', async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
     if (!room) {
       return res.status(404).json({ message: 'Room not found' });
     }
+    auditLogger.info(`Room View: ${req.params.roomId}`);
     res.json(room);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Room View Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Get room statistics
 router.get('/:roomId/stats', async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
@@ -76,13 +119,14 @@ router.get('/:roomId/stats', async (req, res) => {
       callEndTime: room.callEndTime
     };
 
+    auditLogger.info(`Room Stats: ${req.params.roomId}`);
     res.json(stats);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Room Stats Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Get chat history for a room
 router.get('/:roomId/chat', async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
@@ -90,17 +134,30 @@ router.get('/:roomId/chat', async (req, res) => {
       return res.status(404).json({ message: 'Room not found' });
     }
 
+    // For current meeting, only expose chat messages from the current session start onward.
+    // This keeps old chats stored in MongoDB, but each new meeting sees a fresh chat list.
+    let messages = room.chatMessages || [];
+    const boundary = room.sessionStartTime || room.callStartTime;
+    if (boundary) {
+      const start = new Date(boundary).getTime();
+      messages = messages.filter(m => {
+        if (!m.timestamp) return false;
+        return new Date(m.timestamp).getTime() >= start;
+      });
+    }
+
     res.json({
       roomId: room.roomId,
-      chatMessages: room.chatMessages,
-      totalMessages: room.chatMessages.length
+      chatMessages: messages,
+      totalMessages: messages.length
     });
+    auditLogger.info(`Chat History: ${req.params.roomId}`);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Chat History Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Get rooms by creator
 router.get('/creator/:participantId', async (req, res) => {
   try {
     const rooms = await Room.find({ 
@@ -112,12 +169,13 @@ router.get('/creator/:participantId', async (req, res) => {
       rooms,
       totalRooms: rooms.length
     });
+    auditLogger.info(`Creator Rooms: ${req.params.participantId}`);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Creator Rooms Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Get active rooms
 router.get('/status/active', async (req, res) => {
   try {
     const activeRooms = await Room.find({ 
@@ -128,17 +186,21 @@ router.get('/status/active', async (req, res) => {
       activeRooms,
       count: activeRooms.length
     });
+    auditLogger.info(`Active Rooms Access`);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Active Rooms Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
-
 // Create new room
 router.post('/', async (req, res) => {
+  const { error } = roomSchema.validate(req.body);
+  if (error) return res.status(400).json({ message: error.details[0].message });
+
   try {
     const { roomId, creator } = req.body;
+    creator.participantName = creator.participantName.trim() || 'Anonymous'; // HIPAA: Non-empty plain
 
-    // Check if room already exists
     const existingRoom = await Room.findOne({ roomId });
     if (existingRoom) {
       return res.status(400).json({ message: 'Room already exists' });
@@ -146,11 +208,7 @@ router.post('/', async (req, res) => {
 
     const room = new Room({
       roomId,
-      creator: {
-        participantId: creator.participantId,
-        participantName: creator.participantName,
-        role: creator.role || 'admin'
-      },
+      creator,
       participants: [{
         participantId: creator.participantId,
         participantName: creator.participantName,
@@ -164,18 +222,21 @@ router.post('/', async (req, res) => {
       }
     });
 
-    const newRoom = await room.save();
-    res.status(201).json(newRoom);
+    const newRoom = await room.save(); // Encrypts in pre-save
+    auditLogger.info(`Room Created: ${roomId}`);
+    res.status(201).json(newRoom); // Decrypted in post-find
   } catch (error) {
+    auditLogger.error(`Room Create Error: ${error.message}`);
     res.status(400).json({ message: error.message });
   }
 });
 
 // Add participant to room
 router.post('/:roomId/participants', async (req, res) => {
+  const { error } = participantSchema.validate(req.body);
+  if (error) return res.status(400).json({ message: error.details[0].message });
+
   try {
-    const { participantId, participantName, role } = req.body;
-    
     const room = await Room.findOne({ roomId: req.params.roomId });
     if (!room) {
       return res.status(404).json({ message: 'Room not found' });
@@ -185,9 +246,9 @@ router.post('/:roomId/participants', async (req, res) => {
       return res.status(400).json({ message: 'Room is full' });
     }
 
-    room.addParticipant(participantId, participantName, role);
+    // Plain to model
+    room.addParticipant(req.body.participantId, req.body.participantName.trim() || 'Anonymous', req.body.role);
     
-    // Start call if this is the second participant
     if (room.participants.length === 2 && !room.callStartTime) {
       room.callStartTime = new Date();
       room.status = 'active';
@@ -195,65 +256,71 @@ router.post('/:roomId/participants', async (req, res) => {
 
     room.updatedAt = new Date();
     await room.save();
+    auditLogger.info(`Participant Added: ${req.body.participantId} to ${req.params.roomId}`);
 
-    res.json(room);
+    res.json(room); // Decrypted
   } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
-});
-
-// Remove participant from room
-router.delete('/:roomId/participants/:participantId', async (req, res) => {
-  try {
-    const room = await Room.findOne({ roomId: req.params.roomId });
-    if (!room) {
-      return res.status(404).json({ message: 'Room not found' });
-    }
-
-    room.removeParticipant(req.params.participantId);
-    
-    const activeParticipants = room.participants.filter(p => !p.leftAt);
-    
-    // End call if no active participants left
-    if (activeParticipants.length === 0 && room.status === 'active') {
-      room.callEndTime = new Date();
-      room.calculateDuration();
-      room.status = 'ended';
-    }
-
-    room.updatedAt = new Date();
-    await room.save();
-
-    res.json(room);
-  } catch (error) {
+    auditLogger.error(`Participant Add Error: ${error.message}`);
     res.status(400).json({ message: error.message });
   }
 });
 
 // Add chat message to room
 router.post('/:roomId/chat', async (req, res) => {
+  const chatSchema = Joi.object({
+    senderId: Joi.string().required(),
+    senderName: Joi.string().min(1).max(100).required(), // Non-empty plain
+    message: Joi.string().min(1).max(1000).required() // Non-empty plain
+  });
+  const { error } = chatSchema.validate(req.body);
+  if (error) return res.status(400).json({ message: error.details[0].message });
+
   try {
-    const { senderId, senderName, message } = req.body;
-    
-    const room = await Room.findOne({ roomId: req.params.roomId });
+    const plainSenderName = req.body.senderName.trim() || 'Anonymous';
+    const plainMessage = req.body.message.trim();
+
+    const update = {
+      $push: {
+        chatMessages: {
+          senderId: req.body.senderId,
+          senderName: encrypt(plainSenderName),
+          message: encrypt(plainMessage),
+          timestamp: new Date()
+        }
+      },
+      $set: { updatedAt: new Date() }
+    };
+
+    const room = await Room.findOneAndUpdate(
+      { roomId: req.params.roomId },
+      update,
+      { new: true }
+    );
+
     if (!room) {
       return res.status(404).json({ message: 'Room not found' });
     }
 
-    room.addChatMessage(senderId, senderName, message);
-    room.updatedAt = new Date();
-    await room.save();
+    const last = room.chatMessages[room.chatMessages.length - 1];
+    const decryptedChat = {
+      senderId: last.senderId,
+      senderName: decrypt(last.senderName),
+      message: decrypt(last.message),
+      timestamp: last.timestamp
+    };
 
     res.json({
       message: 'Chat message added',
-      chatMessage: room.chatMessages[room.chatMessages.length - 1]
+      chatMessage: decryptedChat
     });
+    auditLogger.info(`Chat Added: ${req.params.roomId}`);
   } catch (error) {
+    auditLogger.error(`Chat Add Error: ${error.message}`);
     res.status(400).json({ message: error.message });
   }
 });
 
-// Start call (when both participants are ready)
+
 router.patch('/:roomId/start-call', async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
@@ -270,13 +337,14 @@ router.patch('/:roomId/start-call', async (req, res) => {
     room.updatedAt = new Date();
     await room.save();
 
+    auditLogger.info(`Call Started: ${req.params.roomId}`);
     res.json(room);
   } catch (error) {
+    auditLogger.error(`Call Start Error: ${error.message}`);
     res.status(400).json({ message: error.message });
   }
 });
 
-// End call
 router.patch('/:roomId/end-call', async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
@@ -291,6 +359,10 @@ router.patch('/:roomId/end-call', async (req, res) => {
     room.callEndTime = new Date();
     room.calculateDuration();
     room.status = 'ended';
+
+    // Clear all chat messages in this room when call is explicitly ended
+    room.chatMessages = [];
+
     room.updatedAt = new Date();
     await room.save();
 
@@ -301,20 +373,23 @@ router.patch('/:roomId/end-call', async (req, res) => {
       callStartTime: room.callStartTime,
       callEndTime: room.callEndTime
     });
+    auditLogger.info(`Call Ended: ${req.params.roomId}`);
   } catch (error) {
+    auditLogger.error(`Call End Error: ${error.message}`);
     res.status(400).json({ message: error.message });
   }
 });
 
-// Update room status
 router.patch('/:roomId/status', async (req, res) => {
+  const statusSchema = Joi.object({ status: Joi.string().valid('waiting', 'active', 'ended').required() });
+  const { error } = statusSchema.validate(req.body);
+  if (error) return res.status(400).json({ message: error.details[0].message });
+
   try {
-    const { status } = req.body;
-    
     const room = await Room.findOneAndUpdate(
       { roomId: req.params.roomId },
       { 
-        status, 
+        status: req.body.status, 
         updatedAt: new Date() 
       },
       { new: true }
@@ -324,13 +399,14 @@ router.patch('/:roomId/status', async (req, res) => {
       return res.status(404).json({ message: 'Room not found' });
     }
 
+    auditLogger.info(`Room Status Update: ${req.params.roomId} to ${req.body.status}`);
     res.json(room);
   } catch (error) {
+    auditLogger.error(`Status Update Error: ${error.message}`);
     res.status(400).json({ message: error.message });
   }
 });
 
-// Delete room (soft delete - mark as ended)
 router.delete('/:roomId', async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
@@ -338,14 +414,12 @@ router.delete('/:roomId', async (req, res) => {
       return res.status(404).json({ message: 'Room not found' });
     }
 
-    // Mark all participants as left
     room.participants.forEach(p => {
       if (!p.leftAt) {
         p.leftAt = new Date();
       }
     });
 
-    // End call if active
     if (room.status === 'active') {
       room.callEndTime = new Date();
       room.calculateDuration();
@@ -355,29 +429,31 @@ router.delete('/:roomId', async (req, res) => {
     room.updatedAt = new Date();
     await room.save();
 
+    auditLogger.info(`Room Soft Deleted: ${req.params.roomId}`);
     res.json({ 
       message: 'Room ended successfully',
       room 
     });
   } catch (error) {
+    auditLogger.error(`Room Delete Error: ${error.message}`);
     res.status(500).json({ message: error.message });
   }
 });
 
-// Hard delete room (permanently remove)
 router.delete('/:roomId/permanent', async (req, res) => {
   try {
     const room = await Room.findOneAndDelete({ roomId: req.params.roomId });
     if (!room) {
       return res.status(404).json({ message: 'Room not found' });
     }
+    auditLogger.info(`Room Hard Deleted: ${req.params.roomId}`);
     res.json({ message: 'Room permanently deleted' });
   } catch (error) {
+    auditLogger.error(`Room Hard Delete Error: ${error.message}`);
     res.status(500).json({ message: error.message });
   }
 });
 
-// Get room analytics
 router.get('/analytics/summary', async (req, res) => {
   try {
     const totalRooms = await Room.countDocuments();
@@ -390,10 +466,11 @@ router.get('/analytics/summary', async (req, res) => {
     ]);
 
     const totalChatMessages = await Room.aggregate([
-      { $project: { messageCount: { $size: '$chatMessages' } } },
-      { $group: { _id: null, total: { $sum: '$messageCount' } } }
+      { $unwind: '$chatMessages' },
+      { $group: { _id: null, total: { $sum: 1 } } }
     ]);
 
+    auditLogger.info(`Analytics Access`);
     res.json({
       totalRooms,
       activeRooms,
@@ -402,7 +479,8 @@ router.get('/analytics/summary', async (req, res) => {
       totalChatMessages: totalChatMessages[0]?.total || 0
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    auditLogger.error(`Analytics Error: ${error.message}`);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
