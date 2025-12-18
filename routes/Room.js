@@ -146,10 +146,18 @@ router.get('/:roomId/chat', async (req, res) => {
       });
     }
 
+    // Decrypt messages before sending
+    const decryptedMessages = messages.map(m => ({
+      senderId: m.senderId,
+      senderName: decrypt(m.senderName),
+      message: decrypt(m.message),
+      timestamp: m.timestamp
+    }));
+
     res.json({
       roomId: room.roomId,
-      chatMessages: messages,
-      totalMessages: messages.length
+      chatMessages: decryptedMessages,
+      totalMessages: decryptedMessages.length
     });
     auditLogger.info(`Chat History: ${req.params.roomId}`);
   } catch (error) {
