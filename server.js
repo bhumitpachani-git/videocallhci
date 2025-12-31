@@ -7,7 +7,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const winston = require('winston');
 const CryptoJS = require('crypto-js');
-const medicalScribeRoutes = require('./routes/medicalScribe');
+const medicalScribeRoutes = require('./routes/medicalScribe.js');
 require('dotenv').config();
 
 const app = express();
