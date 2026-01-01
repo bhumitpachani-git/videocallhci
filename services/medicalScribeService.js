@@ -18,7 +18,7 @@ const scribeLogger = winston.createLogger({
 });
 
 const MEDICAL_SCRIBE_CREATE_URL = 'https://22jlxbxhxzlhb2po3qtltrkqlu0afsxw.lambda-url.us-east-2.on.aws/';
-const MEDICAL_SCRIBE_STATUS_URL = 'https://ugo2tugkuppn6jwuaesrif7xiu0dpmkg.lambda-url.us-east-2.on.aws/';
+const MEDICAL_SCRIBE_STATUS_URL = 'https://yg32eyjbx3p2laumyur32jykhm0mlpoo.lambda-url.us-east-2.on.aws/';
 
 async function createMedicalScribeJob(s3MediaFileUri, jobName) {
   try {
